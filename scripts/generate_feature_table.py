@@ -10,10 +10,10 @@ def clinical_features(feature_table):
 	feature_table = feature_table[feature_table.SEX.isin(['Male', 'Female'])]
 	feature_table = feature_table.assign(Gender_F = feature_table.SEX.values == 'Female')
 	feature_table = feature_table.assign(Gender_F = feature_table.Gender_F.astype(int))
-	#MSI SCORE
-	msi_inds = list(np.where(feature_table.MSI_SCORE==-1)[0])
-	msi_inds.extend(np.where(np.isnan(feature_table.MSI_SCORE))[0])
-	feature_table.loc[feature_table.index.isin(msi_inds),'MSI_SCORE'] = 0
+	# #MSI SCORE
+	# msi_inds = list(np.where(feature_table.MSI_SCORE==-1)[0])
+	# msi_inds.extend(np.where(np.isnan(feature_table.MSI_SCORE))[0])
+	# feature_table.loc[feature_table.index.isin(msi_inds),'MSI_SCORE'] = 0
 	return feature_table
 
 def purity_est(feature_table, maf_somatic, seg):
@@ -49,7 +49,7 @@ def tumor_mutational_burden(feature_table, maf_somatic, impact):
 		snv_count.columns = ['SAMPLE_ID', 'SNVCount']
 		indel_count = pd.DataFrame(maf_somatic[maf_somatic.Variant_Type.isin(['INS', 'DEL'])].SAMPLE_ID.value_counts()).reset_index()
 		indel_count.columns = ['SAMPLE_ID', 'INDELCount']
-		mutation_count = snv_count.merge(indel_count, on = 'SAMPLE_ID', how = 'outer')
+		mutation_count = snv_count.merge(indel_count, on = 'SAMPLE_ID', how = 'left')
 		feature_table = feature_table.merge(mutation_count, on = 'SAMPLE_ID', how = 'left')
 		feature_table.SNVCount = feature_table['SNVCount'].fillna(0)
 		feature_table.INDELCount = feature_table['INDELCount'].fillna(0)
@@ -58,8 +58,21 @@ def tumor_mutational_burden(feature_table, maf_somatic, impact):
 		feature_table = feature_table.assign(SEQ_ASSAY_ID = [si[-3:] for si in feature_table.SAMPLE_ID])
 		norm = 10**6
 		canonical_capture_area = {'IM3':896665, 'IM5':1016478, 'IM6':1139322, 'IM7':1213770}
-		feature_table.SNVCount = feature_table.SNVCount / [canonical_capture_area[panel]/norm if panel in canonical_capture_area.keys() else 'IM7' for panel in feature_table.SEQ_ASSAY_ID]
-		feature_table.INDELCount = feature_table.INDELCount / [canonical_capture_area[panel]/norm if panel in canonical_capture_area.keys() else 'IM7' for panel in feature_table.SEQ_ASSAY_ID]
+
+		snv_divisors = [
+			canonical_capture_area[panel]/norm if panel in canonical_capture_area else np.nan
+			for panel in feature_table.SEQ_ASSAY_ID
+		]
+		feature_table['SNVCount'] = feature_table.SNVCount / snv_divisors
+
+		indel_divisors = [
+			canonical_capture_area[panel]/norm if panel in canonical_capture_area else np.nan
+			for panel in feature_table.SEQ_ASSAY_ID
+		]
+		feature_table['INDELCount'] = feature_table.INDELCount / indel_divisors
+
+		# feature_table.SNVCount = feature_table.SNVCount / [canonical_capture_area[panel]/norm if panel in canonical_capture_area.keys() else 'IM7' for panel in feature_table.SEQ_ASSAY_ID]
+		# feature_table.INDELCount = feature_table.INDELCount / [canonical_capture_area[panel]/norm if panel in canonical_capture_area.keys() else 'IM7' for panel in feature_table.SEQ_ASSAY_ID]
 		feature_table = feature_table.assign(LogSNV_Mb = np.log10(feature_table.SNVCount+1))
 		feature_table = feature_table.assign(LogINDEL_Mb = np.log10(feature_table.INDELCount+1))
 		feature_table = feature_table.drop(['SNVCount', 'INDELCount', 'SEQ_ASSAY_ID'], axis = 1)
@@ -177,14 +190,48 @@ def fusions(SV):
 	fusion_list = pd.read_csv('data/fusions.txt', sep = '\t')
 	fusion_genes = set(fusion_list[~(fusion_list.Gene_Fusion.isna())].Gene_Fusion)
 	fusion_intragenic = set(fusion_list[~(fusion_list.Intragenic_Fusion.isna())].Intragenic_Fusion) 
-	SV_data = SV[(SV.Hugo_Symbol.isin(fusion_genes)) | (SV.Fusion.isin(fusion_intragenic))] #each fusion is listed twice per sample with each fusion partner
+	#### if latest version, new data_sv.txt instead of data_fusions.txt ####
+	SV_data = SV[
+		(SV['Site1_Hugo_Symbol'].isin(fusion_genes)) |
+		(SV['Site2_Hugo_Symbol'].isin(fusion_genes)) |
+		(
+			(SV['Site2_Hugo_Symbol'].isna() | (SV['Site1_Hugo_Symbol'] == SV['Site2_Hugo_Symbol']))
+			& SV['Site1_Hugo_Symbol'].isin(fusion_intragenic)
+		)
+	]
+
+	#### if data_fusions.txt ####
+	# SV_data = SV[(SV.Hugo_Symbol.isin(fusion_genes)) | (SV.Fusion.isin(fusion_intragenic))] #each fusion is listed twice per sample with each fusion partner
 	fusion_dic = {}
 	for gene in fusion_genes:
 		fusion_dic[gene] = gene + '_fusion'
 	for fusion in fusion_intragenic:
 		gene = fusion.split('-intragenic')[0]
 		fusion_dic[gene] = gene + '_SV'
-	SV_data = SV_data.assign(fusion_label = SV_data.Hugo_Symbol.replace(fusion_dic))
+
+	#### if latest version, new data_sv.txt instead of data_fusions.txt ####
+	# Create a function to map each row to a fusion label
+	def get_fusion_label(row):
+		site1 = row['Site1_Hugo_Symbol']
+		site2 = row['Site2_Hugo_Symbol']
+		if pd.isna(site2) or site1 == site2:
+			# Intragenic: use Site1 only
+			return fusion_dic.get(site1, 'Other')
+		else:
+			# Intergenic: pick first partner that’s in the dict
+			if site1 in fusion_dic:
+				return fusion_dic[site1]
+			elif site2 in fusion_dic:
+				return fusion_dic[site2]
+			else:
+				return 'Other'
+
+	# Apply to the filtered SV_data
+	SV_data['fusion_label'] = SV_data.apply(get_fusion_label, axis=1)
+
+	#### if data_fusions.txt ####
+	# SV_data = SV_data.assign(fusion_label = SV_data.Hugo_Symbol.replace(fusion_dic))
+
 	#aggregate by patient
 	SV_data = pd.crosstab(index = SV_data.SAMPLE_ID, columns = SV_data.fusion_label)
 	SV_data.iloc[:,1:] = np.where(SV_data.iloc[:,1:]>=1,1,0)
@@ -216,8 +263,10 @@ def sbs_counts(maf_all):
 	ref_fasta = Fasta(path_to_fasta) #will error out if specified incorrectly
 
 	maf = maf_all[(maf_all.Variant_Type== 'SNP')]
-	maf = maf.assign(ident = [chrom + '_' + str(start-2) + '_' + str(end+1) for chrom, start, end in zip(maf.Chromosome, maf.Start_Position, maf.End_Position)])
-	
+	# maf = maf.assign(ident = [chrom + '_' + str(start-2) + '_' + str(end+1) for chrom, start, end in zip(maf.Chromosome, maf.Start_Position, maf.End_Position)])
+	maf = maf.assign(ident = [f"{chrom}_{start - 2}_{end + 1}" for chrom, start, end in zip(maf.Chromosome, maf.Start_Position, maf.End_Position)])
+
+
 	#classify substitutions from unknown, germline SNP mutations in the maf
 	substitution_order = ["ACAA", "ACAC", "ACAG", "ACAT", "CCAA", "CCAC", "CCAG", "CCAT", "GCAA", "GCAC", "GCAG", "GCAT", "TCAA", "TCAC", "TCAG", "TCAT", "ACGA", "ACGC", "ACGG", "ACGT", "CCGA", "CCGC", "CCGG", "CCGT", "GCGA", "GCGC", "GCGG", "GCGT", "TCGA", "TCGC", "TCGG", "TCGT", "ACTA", "ACTC", "ACTG", "ACTT", "CCTA", "CCTC", "CCTG", "CCTT", "GCTA", "GCTC", "GCTG", "GCTT", "TCTA", "TCTC", "TCTG", "TCTT", "ATAA", "ATAC", "ATAG", "ATAT", "CTAA", "CTAC", "CTAG", "CTAT", "GTAA", "GTAC", "GTAG", "GTAT", "TTAA", "TTAC", "TTAG", "TTAT", "ATCA", "ATCC", "ATCG", "ATCT", "CTCA", "CTCC", "CTCG", "CTCT", "GTCA", "GTCC", "GTCG", "GTCT", "TTCA", "TTCC", "TTCG", "TTCT", "ATGA", "ATGC", "ATGG", "ATGT", "CTGA", "CTGC", "CTGG", "CTGT", "GTGA", "GTGC", "GTGG", "GTGT", "TTGA", "TTGC", "TTGG", "TTGT"]
 	pyrimidines = ['C', 'T']
@@ -308,16 +357,15 @@ impact = True
 data_clinical_sample = pd.read_table(path_to_data + '/data_clinical_sample.txt', skiprows = 4)
 data_clinical_patient = pd.read_table(path_to_data + '/data_clinical_patient.txt', skiprows = 4)
 data_clinical_sample = pd.merge(data_clinical_sample, data_clinical_patient)
-data_clinical_sample = data_clinical_sample[data_clinical_sample.SAMPLE_ID.str.contains('IM')] #only looking at MSK-IMPACT patients
+# data_clinical_sample = data_clinical_sample[data_clinical_sample.SAMPLE_ID.str.contains('IM')] #only looking at MSK-IMPACT patients
 
 #load cancertypes
 input_cancertypes = pd.read_table('data/tumor_type_final.txt') #need to fix
 feature_table = pd.merge(data_clinical_sample, input_cancertypes, how = 'left', on = ['CANCER_TYPE', 'CANCER_TYPE_DETAILED'])
 feature_table.Cancer_Type = feature_table.Cancer_Type.fillna('other')
 feature_table = feature_table.assign(Classification_Category = ['train' if ct != 'other' else 'other' for ct in feature_table.Cancer_Type])
-
 #Signatures
-sigs = pd.read_table('data/msk_solid_heme_data_mutations_unfiltered.sigs.tab.txt')
+sigs = pd.read_table('/data1/morrisq/yuj13/llm_genomics/msk_solid_heme_data_mutations_unfiltered.sigs.tab.txt')
 sigs = sigs.rename({'Tumor_Sample_Barcode':'SAMPLE_ID'}, axis = 1)
 
 #CN Data
@@ -327,13 +375,14 @@ seg = seg.rename({'ID':'SAMPLE_ID'}, axis = 1)
 cn = pd.read_table(path_to_data + '/data_CNA.txt')
 
 #Fusions
-SV = pd.read_table(path_to_data + '/data_fusions.txt')
-SV = SV.rename({'Tumor_Sample_Barcode':'SAMPLE_ID', 'Sample_ID':'SAMPLE_ID','Site2_Contig':'Hugo_Symbol'}, axis = 1)
+SV = pd.read_table(path_to_data + '/data_sv.txt')
+SV = SV.rename({'Tumor_Sample_Barcode':'SAMPLE_ID', 'Sample_ID': 'SAMPLE_ID', 'Sample_Id':'SAMPLE_ID'}, axis = 1)
 
 #Mutations 
-maf = pd.read_table(path_to_data + '/data_mutations_extended.txt', skiprows = 1)
+maf = pd.read_table(path_to_data + '/data_mutations_extended.txt')
 maf = maf.rename({'Tumor_Sample_Barcode':'SAMPLE_ID'}, axis =1)
 maf = maf.sort_values(by = 'SAMPLE_ID')
+maf['Mutation_Status'] = maf['Mutation_Status'].astype(str).str.upper()
 maf_all_somatic = maf[maf.Mutation_Status=='SOMATIC'] #calculate purity estimates, TMB from all detected somatic mutations, not just impact-341 
 
 #correct Hugo Symbols for current notation, only include msk_impact 341 genes
@@ -359,7 +408,9 @@ maf_somatic = maf[maf.Mutation_Status=='SOMATIC'] #only somatic
 
 #extract clinical features (gender, MSI Score)
 feature_table = clinical_features(feature_table)
-feature_table = feature_table[['SAMPLE_ID', 'CANCER_TYPE', 'CANCER_TYPE_DETAILED', 'Cancer_Type', 'SAMPLE_TYPE', 'PRIMARY_SITE', 'METASTATIC_SITE', 'Classification_Category', 'Gender_F', 'MSI_SCORE']]
+feature_table = feature_table[['SAMPLE_ID', 'CANCER_TYPE', 'CANCER_TYPE_DETAILED', 'Cancer_Type', 'SAMPLE_TYPE', 'Classification_Category', 'Gender_F']]
+
+### feature_table = feature_table[['SAMPLE_ID', 'CANCER_TYPE', 'CANCER_TYPE_DETAILED', 'Cancer_Type', 'SAMPLE_TYPE', 'PRIMARY_SITE', 'METASTATIC_SITE', 'Classification_Category', 'Gender_F', 'MSI_SCORE']]
 #remove low purity
 feature_table = purity_est(feature_table, maf_all_somatic, seg)
 print('clinical integrated')
