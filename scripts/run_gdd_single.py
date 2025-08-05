@@ -110,13 +110,28 @@ def top_shap_single(model, test_x, test_y, colnames):
 	shap_values = shap_values[[i for i in shap_values.columns if i in feature_annotation.in_col.values]]
 	shap_values = shap_values.T
 	shap_values.sort_values(by = 'Shapley_Values', axis = 0, inplace=True, ascending=False)
+	# shap_cols = []
+	# for col, fv in zip(shap_values.index, shap_values.Feature_Values):
+	# 	new_col = feature_annotation[(feature_annotation.in_col==col)]
+	# 	if len(new_col)==2:
+	# 		shap_cols.append(new_col[new_col.value==fv].out_col.values[0])
+	# 	else:
+	# 		shap_cols.append(new_col.out_col.values[0])
 	shap_cols = []
 	for col, fv in zip(shap_values.index, shap_values.Feature_Values):
-		new_col = feature_annotation[(feature_annotation.in_col==col)]
-		if len(new_col)==2:
-			shap_cols.append(new_col[new_col.value==fv].out_col.values[0])
+		new_col = feature_annotation[feature_annotation.in_col == col]
+
+		if len(new_col) == 0:
+			shap_cols.append('NA')
+		elif len(new_col) == 2:
+			match = new_col[new_col.value==fv]
+			if len(match) > 0:
+				shap_cols.append(match.out_col.values[0])
+			else:
+				shap_cols.append('NA')  # Fallback if no value match
 		else:
 			shap_cols.append(new_col.out_col.values[0])
+
 	shap_values = shap_values.assign(Shapley_Columns = shap_cols)
 	return shap_values[:10] 
 
@@ -151,35 +166,52 @@ if __name__ == "__main__":
 	#load data, column names, cancer types and annotations
 	model_path = sys.argv[1]
 	predict_single_fn = sys.argv[2]
-	single_data = pd.read_csv(predict_single_fn)
+	multi_data = pd.read_csv(predict_single_fn)
 	colnames = pd.read_csv('data/ft_colnames.csv')['columns'].values
 	ctypes = list(pd.read_csv('data/tumor_type_ordered.csv')['Cancer_Type'].values)
-
-	#process single instance, save
-	single_data, gdd_input = process_data_single(single_data, colnames)
-	#run predictions
-	gdd_data = torch.from_numpy(np.array(gdd_input)).float()
-	gdd_data = gdd_data.to(device)
-	# gdd_model = torch.load('/data/bergerm1/ch_GDDP2/ensemble.pt')
-	gdd_model = torch.load(model_path, map_location=torch.device(device))
-	print('model loaded:', model_path)
-
-	preds, probs, pred_label, allprobs = pred_results(gdd_model, gdd_data, ctypes) 
-	res = pd.DataFrame([preds,probs,pred_label]).T
-	res.columns = ['pred', 'prob', 'pred_label']
-
-	#calculate shapley values
-	gdd_x = np.array(gdd_input)
-	gdd_y = np.array([preds[0]])
-	shap_values = top_shap_single(gdd_model, gdd_x, gdd_y, colnames)
-	if len(shap_values.index) >= 10:
-		top_shap = shap_values[:10]
-	else:
-		fill = pd.DataFrame([['NA', "NA", 0] for i in range(10-len(shap_values))])
-		fill.columns = ['Feature_Values', 'Shapley_Columns', 'Shapley_Values']
-		top_shap = pd.concat([shap_values, fill])
-
-	#format final res
-	final_res = format_gdd_output(single_data, res, allprobs, top_shap)
+	
 	final_res_fn = sys.argv[3]
-	final_res.to_csv(final_res_fn)
+
+	# Does file exist? How many rows already written?
+	if os.path.exists(final_res_fn):
+		existing = pd.read_csv(final_res_fn)
+		done_ids = set(existing['SAMPLE_ID'].unique())  # or whatever unique ID you have
+		first_write = False
+	else:
+		done_ids = set()
+		first_write = True
+	mode = 'a' if not first_write else 'w'
+	with open(final_res_fn, mode) as f:
+		for i in range(len(multi_data)):
+			single_data = multi_data.iloc[[i]]
+			sample_id = single_data['SAMPLE_ID'].values[0]  # adjust to your unique ID
+
+			# Skip if already done
+			if sample_id in done_ids:
+				print(f"Skipping {sample_id} — already in output.")
+				continue
+
+			# Process single row
+			single_data, gdd_input = process_data_single(single_data, colnames)
+			gdd_data = torch.from_numpy(np.array(gdd_input)).float().to(device)
+			gdd_model = torch.load(model_path, map_location=device)
+
+			preds, probs, pred_label, allprobs = pred_results(gdd_model, gdd_data, ctypes)
+			res = pd.DataFrame([preds, probs, pred_label]).T
+			res.columns = ['pred', 'prob', 'pred_label']
+
+			gdd_x = np.array(gdd_input)
+			gdd_y = np.array([preds[0]])
+			shap_values = top_shap_single(gdd_model, gdd_x, gdd_y, colnames)
+			if len(shap_values.index) >= 10:
+				top_shap = shap_values[:10]
+			else:
+				fill = pd.DataFrame([['NA', "NA", 0] for _ in range(10 - len(shap_values))])
+				fill.columns = ['Feature_Values', 'Shapley_Columns', 'Shapley_Values']
+				top_shap = pd.concat([shap_values, fill])
+
+			final_res = format_gdd_output(single_data, res, allprobs, top_shap)
+
+			# Write line by line in append mode
+			final_res.to_csv(f, header=first_write, index=False)
+			first_write = False
